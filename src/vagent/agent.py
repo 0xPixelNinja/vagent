@@ -2,7 +2,7 @@
 Voice Agent using LiveKit Agents SDK v1.3
 STT: faster-whisper (large-v3-turbo)
 LLM: Ollama gemma3:4b
-TTS: Kokoro-FastAPI
+TTS: Kokoro-FastAPI or VibeVoice-Realtime (configurable)
 """
 
 import logging
@@ -24,7 +24,7 @@ from livekit.agents import (
 )
 from livekit.plugins import silero, openai as lk_openai
 
-from vagent.plugins import FasterWhisperSTT, KokoroTTS
+from vagent.plugins import FasterWhisperSTT, KokoroTTS, VibeVoiceTTS
 
 load_dotenv()
 
@@ -74,11 +74,34 @@ def prewarm(proc: JobProcess):
     except Exception as e:
         logger.error(f"Failed to initialize STT: {e}")
 
+    # TTS engine selection: "kokoro" (default) or "vibevoice"
+    tts_engine = os.getenv("VAGENT_TTS_ENGINE", "kokoro").strip().lower()
+    
     try:
-        proc.userdata["tts"] = KokoroTTS(
-            base_url="http://localhost:8880/v1",
-            voice="af_heart",
-        )
+        if tts_engine == "vibevoice":
+            # VibeVoice-Realtime TTS via WebSocket
+            vibevoice_url = os.getenv("VAGENT_VIBEVOICE_URL", "ws://localhost:3000")
+            vibevoice_voice = os.getenv("VAGENT_VIBEVOICE_VOICE", "en-WHTest_man")
+            vibevoice_cfg = float(os.getenv("VAGENT_VIBEVOICE_CFG", "1.5"))
+            vibevoice_steps = int(os.getenv("VAGENT_VIBEVOICE_STEPS", "5"))
+            
+            proc.userdata["tts"] = VibeVoiceTTS(
+                base_url=vibevoice_url,
+                voice=vibevoice_voice,
+                cfg_scale=vibevoice_cfg,
+                inference_steps=vibevoice_steps,
+            )
+            logger.info(f"Using VibeVoice TTS at {vibevoice_url}")
+        else:
+            # Default: Kokoro TTS via HTTP
+            kokoro_url = os.getenv("VAGENT_KOKORO_URL", "http://localhost:8880/v1")
+            kokoro_voice = os.getenv("VAGENT_KOKORO_VOICE", "af_heart")
+            
+            proc.userdata["tts"] = KokoroTTS(
+                base_url=kokoro_url,
+                voice=kokoro_voice,
+            )
+            logger.info(f"Using Kokoro TTS at {kokoro_url}")
     except Exception as e:
         logger.error(f"Failed to initialize TTS: {e}")
 
@@ -151,10 +174,29 @@ async def entrypoint(ctx: JobContext):
 
         tts = ctx.proc.userdata.get("tts")
         if not tts:
-            tts = KokoroTTS(
-                base_url="http://localhost:8880/v1",
-                voice="af_heart",
-            )
+            # Fallback TTS initialization if prewarm failed
+            tts_engine = os.getenv("VAGENT_TTS_ENGINE", "kokoro").strip().lower()
+            
+            if tts_engine == "vibevoice":
+                vibevoice_url = os.getenv("VAGENT_VIBEVOICE_URL", "ws://localhost:3000")
+                vibevoice_voice = os.getenv("VAGENT_VIBEVOICE_VOICE", "en-WHTest_man")
+                vibevoice_cfg = float(os.getenv("VAGENT_VIBEVOICE_CFG", "1.5"))
+                vibevoice_steps = int(os.getenv("VAGENT_VIBEVOICE_STEPS", "5"))
+                
+                tts = VibeVoiceTTS(
+                    base_url=vibevoice_url,
+                    voice=vibevoice_voice,
+                    cfg_scale=vibevoice_cfg,
+                    inference_steps=vibevoice_steps,
+                )
+            else:
+                kokoro_url = os.getenv("VAGENT_KOKORO_URL", "http://localhost:8880/v1")
+                kokoro_voice = os.getenv("VAGENT_KOKORO_VOICE", "af_heart")
+                
+                tts = KokoroTTS(
+                    base_url=kokoro_url,
+                    voice=kokoro_voice,
+                )
 
         session = AgentSession(
             vad=vad,
