@@ -1,44 +1,44 @@
 """
-Faster-Whisper STT plugin for LiveKit Agents.
-Uses the local large-v3-turbo model for speech-to-text.
+Faster-Whisper STT plugin for LiveKit Agents (Client).
+Connects to a remote STT server.
 """
 
-import asyncio
 import logging
 from dataclasses import dataclass
 
-import numpy as np
-from faster_whisper import WhisperModel
-from livekit import rtc
+import httpx
 from livekit.agents import stt
 from livekit.agents.types import DEFAULT_API_CONNECT_OPTIONS, NOT_GIVEN, APIConnectOptions, NotGivenOr
 from livekit.agents.utils import AudioBuffer, shortuuid
 
 from vagent.utils.latency import LatencyTracker
 
-logger = logging.getLogger("stt-whisper")
+logger = logging.getLogger("stt-whisper-client")
 
 
 @dataclass
 class STTOptions:
     language: str | None = None
-    beam_size: int = 5
+    beam_size: int = 1
     vad_filter: bool = True
     without_timestamps: bool = True
+    url: str = "http://localhost:8083/transcribe"
 
 
 class FasterWhisperSTT(stt.STT):
-    """Faster-Whisper based STT for LiveKit Agents."""
+    """Faster-Whisper based STT client for LiveKit Agents."""
 
     def __init__(
         self,
-        model_path: str = "models",
-        device: str = "cuda",
-        compute_type: str = "float16",
+        url: str = "http://localhost:8083/transcribe",
         language: str | None = None,
-        beam_size: int = 5,
+        beam_size: int = 1,
         vad_filter: bool = True,
         without_timestamps: bool = True,
+        # Keep these for compatibility with existing agent.py calls, but ignore them
+        model_path: str | None = None,
+        device: str | None = None,
+        compute_type: str | None = None,
     ):
         super().__init__(
             capabilities=stt.STTCapabilities(
@@ -46,41 +46,18 @@ class FasterWhisperSTT(stt.STT):
                 interim_results=False,
             )
         )
-        self._model_path = model_path
-        self._device = device
-        self._compute_type = compute_type
         self._opts = STTOptions(
             language=language,
             beam_size=beam_size,
             vad_filter=vad_filter,
             without_timestamps=without_timestamps,
+            url=url,
         )
-        self._model: WhisperModel | None = None
+        self._client = httpx.AsyncClient(timeout=30.0)
 
-    @staticmethod
-    def _resample_to_16k(audio: np.ndarray, src_sr: int) -> np.ndarray:
-        if src_sr == 16000:
-            return audio.astype(np.float32, copy=False)
-
-        # Polyphase resampling is generally faster than FFT resampling.
-        from scipy import signal
-        import math
-
-        g = math.gcd(src_sr, 16000)
-        up = 16000 // g
-        down = src_sr // g
-        return signal.resample_poly(audio, up, down).astype(np.float32, copy=False)
-
-    def _ensure_model(self) -> WhisperModel:
-        if self._model is None:
-            logger.info(f"Loading Whisper model from {self._model_path}")
-            self._model = WhisperModel(
-                self._model_path,
-                device=self._device,
-                compute_type=self._compute_type,
-            )
-            logger.info("Whisper model loaded successfully")
-        return self._model
+    def load(self):
+        """No-op for client, or check connection."""
+        pass
 
     async def _recognize_impl(
         self,
@@ -93,68 +70,69 @@ class FasterWhisperSTT(stt.STT):
 
         LatencyTracker.get().stt_started()
 
-        model = self._ensure_model()
+        try:
+            # Handle both single frame and list of frames
+            if isinstance(buffer, list):
+                frames = buffer
+            else:
+                frames = [buffer]
 
-        # Handle both single frame and list of frames
-        if isinstance(buffer, list):
-            frames = buffer
-        else:
-            frames = [buffer]
-
-        # Combine all frames into a single audio array
-        all_data = b"".join(frame.data for frame in frames)
-        sample_rate = frames[0].sample_rate
-        num_channels = frames[0].num_channels
-
-        # Convert bytes to numpy array (assuming 16-bit signed int)
-        audio_data = np.frombuffer(all_data, dtype=np.int16).astype(np.float32)
-
-        # Convert to mono if stereo
-        if num_channels > 1:
-            audio_data = audio_data.reshape(-1, num_channels).mean(axis=1)
-
-        # Normalize to [-1, 1]
-        audio_data = audio_data / 32768.0
-
-        # Resample to 16kHz if needed (Whisper expects 16kHz)
-        if sample_rate != 16000:
-            audio_data = self._resample_to_16k(audio_data, sample_rate)
-
-        # Run transcription in thread pool to avoid blocking
-        loop = asyncio.get_event_loop()
-        
-        lang = language if language is not NOT_GIVEN else self._opts.language
-        
-        segments, info = await loop.run_in_executor(
-            None,
-            lambda: model.transcribe(
-                audio_data,
-                language=lang,
-                beam_size=self._opts.beam_size,
-                vad_filter=self._opts.vad_filter,
-                without_timestamps=self._opts.without_timestamps,
-            ),
-        )
-
-        # Collect all segments
-        text_parts = []
-        for segment in segments:
-            text_parts.append(segment.text.strip())
-
-        full_text = " ".join(text_parts)
-
-        logger.debug(f"Transcribed: {full_text}")
-
-        LatencyTracker.get().stt_finished(full_text)
-
-        return stt.SpeechEvent(
-            type=stt.SpeechEventType.FINAL_TRANSCRIPT,
-            request_id=shortuuid(),
-            alternatives=[
-                stt.SpeechData(
-                    text=full_text,
-                    language=info.language if info.language else "en",
-                    confidence=1.0,
+            if not frames:
+                return stt.SpeechEvent(
+                    type=stt.SpeechEventType.FINAL_TRANSCRIPT,
+                    request_id=shortuuid(),
+                    alternatives=[],
                 )
-            ],
-        )
+
+            # Combine all frames into a single audio buffer
+            all_data = b"".join(frame.data for frame in frames)
+            sample_rate = frames[0].sample_rate
+            num_channels = frames[0].num_channels
+
+            lang = language if language is not NOT_GIVEN else self._opts.language
+
+            # Prepare form data
+            data = {
+                "beam_size": str(self._opts.beam_size),
+                "vad_filter": str(self._opts.vad_filter).lower(),
+                "without_timestamps": str(self._opts.without_timestamps).lower(),
+                "sample_rate": str(sample_rate),
+                "channels": str(num_channels),
+            }
+            if lang:
+                data["language"] = lang
+
+            files = {"file": ("audio.raw", all_data, "application/octet-stream")}
+
+            response = await self._client.post(self._opts.url, data=data, files=files)
+            response.raise_for_status()
+            result = response.json()
+
+            if "error" in result and result["error"]:
+                raise Exception(result["error"])
+
+            full_text = result.get("text", "")
+            detected_lang = result.get("language", "en")
+
+            logger.debug(f"Transcribed: {full_text}")
+
+            LatencyTracker.get().stt_finished(full_text)
+
+            return stt.SpeechEvent(
+                type=stt.SpeechEventType.FINAL_TRANSCRIPT,
+                request_id=shortuuid(),
+                alternatives=[
+                    stt.SpeechData(
+                        text=full_text,
+                        language=detected_lang,
+                        confidence=1.0,
+                    )
+                ],
+            )
+        except Exception as e:
+            logger.error(f"STT recognition failed: {e}")
+            return stt.SpeechEvent(
+                type=stt.SpeechEventType.FINAL_TRANSCRIPT,
+                request_id=shortuuid(),
+                alternatives=[],
+            )

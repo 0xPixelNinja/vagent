@@ -55,23 +55,27 @@ def _now() -> float:
 
 def _load_wav_mono_float32(path: Path) -> tuple[np.ndarray, int]:
     """Load a WAV file to mono float32 in range [-1, 1]."""
-    from scipy.io import wavfile
+    try:
+        from scipy.io import wavfile
 
-    sr, data = wavfile.read(str(path))
+        sr, data = wavfile.read(str(path))
 
-    if data.ndim == 2:
-        data = data.mean(axis=1)
+        if data.ndim == 2:
+            data = data.mean(axis=1)
 
-    if data.dtype == np.int16:
-        audio = data.astype(np.float32) / 32768.0
-    elif data.dtype == np.int32:
-        audio = data.astype(np.float32) / 2147483648.0
-    elif data.dtype == np.float32 or data.dtype == np.float64:
-        audio = data.astype(np.float32)
-    else:
-        raise ValueError(f"Unsupported WAV dtype: {data.dtype}")
+        if data.dtype == np.int16:
+            audio = data.astype(np.float32) / 32768.0
+        elif data.dtype == np.int32:
+            audio = data.astype(np.float32) / 2147483648.0
+        elif data.dtype == np.float32 or data.dtype == np.float64:
+            audio = data.astype(np.float32)
+        else:
+            raise ValueError(f"Unsupported WAV dtype: {data.dtype}")
 
-    return audio, int(sr)
+        return audio, int(sr)
+    except Exception as e:
+        print(f"Error loading WAV file {path}: {e}")
+        sys.exit(1)
 
 
 def _resample(audio: np.ndarray, src_sr: int, dst_sr: int) -> np.ndarray:
@@ -110,32 +114,36 @@ def bench_stt(
 ) -> tuple[str, list[Timing]]:
     timings: list[Timing] = []
 
-    t0 = _now()
-    model = WhisperModel(
-        str(model_path),
-        device=device,
-        compute_type=compute_type,
-    )
-    timings.append(Timing("stt_model_load", _ms(_now() - t0)))
+    try:
+        t0 = _now()
+        model = WhisperModel(
+            str(model_path),
+            device=device,
+            compute_type=compute_type,
+        )
+        timings.append(Timing("stt_model_load", _ms(_now() - t0)))
 
-    t1 = _now()
-    segments, info = model.transcribe(
-        audio_16k,
-        language=language,
-        beam_size=beam_size,
-        vad_filter=vad_filter,
-        without_timestamps=without_timestamps,
-    )
-    text_parts: list[str] = []
-    for seg in segments:
-        text_parts.append(seg.text.strip())
-    transcript = " ".join([p for p in text_parts if p])
-    timings.append(Timing("stt_transcribe", _ms(_now() - t1)))
+        t1 = _now()
+        segments, info = model.transcribe(
+            audio_16k,
+            language=language,
+            beam_size=beam_size,
+            vad_filter=vad_filter,
+            without_timestamps=without_timestamps,
+        )
+        text_parts: list[str] = []
+        for seg in segments:
+            text_parts.append(seg.text.strip())
+        transcript = " ".join([p for p in text_parts if p])
+        timings.append(Timing("stt_transcribe", _ms(_now() - t1)))
 
-    if info.language:
-        transcript = transcript
+        if info.language:
+            transcript = transcript
 
-    return transcript, timings
+        return transcript, timings
+    except Exception as e:
+        print(f"STT benchmark failed: {e}")
+        return "", timings
 
 
 async def bench_llm(*, client: openai.AsyncClient, model: str, prompt: str) -> tuple[str, list[Timing]]:
@@ -145,26 +153,29 @@ async def bench_llm(*, client: openai.AsyncClient, model: str, prompt: str) -> t
     first_token_at: float | None = None
     chunks: list[str] = []
 
-    stream = await client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": "Answer concisely."},
-            {"role": "user", "content": prompt},
-        ],
-        stream=True,
-    )
+    try:
+        stream = await client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": "Answer concisely."},
+                {"role": "user", "content": prompt},
+            ],
+            stream=True,
+        )
 
-    async for event in stream:
-        delta = None
-        try:
-            delta = event.choices[0].delta.content
-        except Exception:
+        async for event in stream:
             delta = None
+            try:
+                delta = event.choices[0].delta.content
+            except Exception:
+                delta = None
 
-        if delta:
-            if first_token_at is None:
-                first_token_at = _now()
-            chunks.append(delta)
+            if delta:
+                if first_token_at is None:
+                    first_token_at = _now()
+                chunks.append(delta)
+    except Exception as e:
+        print(f"LLM benchmark failed: {e}")
 
     t_end = _now()
 
@@ -202,14 +213,17 @@ async def bench_tts(
     first_audio_at: float | None = None
     out = bytearray()
 
-    async with client.stream("POST", url, json=payload) as resp:
-        resp.raise_for_status()
-        async for chunk in resp.aiter_bytes(chunk_size=chunk_size):
-            if not chunk:
-                continue
-            if first_audio_at is None:
-                first_audio_at = _now()
-            out.extend(chunk)
+    try:
+        async with client.stream("POST", url, json=payload) as resp:
+            resp.raise_for_status()
+            async for chunk in resp.aiter_bytes(chunk_size=chunk_size):
+                if not chunk:
+                    continue
+                if first_audio_at is None:
+                    first_audio_at = _now()
+                out.extend(chunk)
+    except Exception as e:
+        print(f"TTS benchmark failed: {e}")
 
     t_end = _now()
 
@@ -391,6 +405,9 @@ async def main() -> int:
 
         print(json.dumps(out, indent=2))
         return 0
+    except Exception as e:
+        print(f"Benchmark failed: {e}", file=sys.stderr)
+        return 1
     finally:
         await tts_http.aclose()
         await llm_http.aclose()

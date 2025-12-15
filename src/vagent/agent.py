@@ -20,6 +20,7 @@ from livekit.agents import (
     JobProcess,
     RoomInputOptions,
     cli,
+    llm,
 )
 from livekit.plugins import silero, openai as lk_openai
 
@@ -48,25 +49,38 @@ server = AgentServer()
 
 def prewarm(proc: JobProcess):
     """Prewarm models to reduce first-response latency."""
-    proc.userdata["vad"] = silero.VAD.load()
+    try:
+        proc.userdata["vad"] = silero.VAD.load()
+    except Exception as e:
+        logger.error(f"Failed to load VAD model: {e}")
 
-    # Latency/quality knobs (defaults preserve current behavior)
-    beam_size = int(os.getenv("VAGENT_STT_BEAM_SIZE", "5"))
+    # Latency/quality knobs
+    # Default beam_size to 1 for speed
+    beam_size = int(os.getenv("VAGENT_STT_BEAM_SIZE", "1"))
     vad_filter = os.getenv("VAGENT_STT_VAD_FILTER", "1").strip().lower() in {"1", "true", "yes", "on"}
     without_timestamps = os.getenv("VAGENT_STT_WITHOUT_TIMESTAMPS", "1").strip().lower() in {"1", "true", "yes", "on"}
 
-    proc.userdata["stt"] = FasterWhisperSTT(
-        model_path=str(MODELS_DIR),
-        device="cuda",
-        compute_type="float16",
-        beam_size=beam_size,
-        vad_filter=vad_filter,
-        without_timestamps=without_timestamps,
-    )
-    proc.userdata["tts"] = KokoroTTS(
-        base_url="http://localhost:8880/v1",
-        voice="af_heart",
-    )
+    try:
+        stt_instance = FasterWhisperSTT(
+            model_path=str(MODELS_DIR),
+            device="cuda",
+            compute_type="float16",
+            beam_size=beam_size,
+            vad_filter=vad_filter,
+            without_timestamps=without_timestamps,
+        )
+        stt_instance.load()  # Load model into VRAM immediately
+        proc.userdata["stt"] = stt_instance
+    except Exception as e:
+        logger.error(f"Failed to initialize STT: {e}")
+
+    try:
+        proc.userdata["tts"] = KokoroTTS(
+            base_url="http://localhost:8880/v1",
+            voice="af_heart",
+        )
+    except Exception as e:
+        logger.error(f"Failed to initialize TTS: {e}")
 
 
 server.setup_fnc = prewarm
@@ -92,40 +106,83 @@ class VoiceAssistant(Agent):
 async def entrypoint(ctx: JobContext):
     """Main entrypoint for the voice agent."""
 
-    # Ollama's OpenAI-compatible streaming can legitimately pause (model load, long decode).
-    ollama_http = httpx.AsyncClient(
-        follow_redirects=True,
-        limits=httpx.Limits(
-            max_connections=50,
-            max_keepalive_connections=50,
-            keepalive_expiry=120,
-        ),
-    )
-    ollama_client = openai.AsyncClient(
-        api_key="ollama",
-        base_url="http://localhost:11434/v1",
-        max_retries=2,
-        http_client=ollama_http,
-    )
-    ollama_llm = lk_openai.LLM(model="gemma3:4b", client=ollama_client)
+    try:
+        # Ollama's OpenAI-compatible streaming
+        ollama_http = httpx.AsyncClient(
+            follow_redirects=True,
+            limits=httpx.Limits(
+                max_connections=50,
+                max_keepalive_connections=50,
+                keepalive_expiry=120,
+            ),
+        )
+        ollama_client = openai.AsyncClient(
+            api_key="ollama",
+            base_url="http://localhost:11434/v1",
+            max_retries=2,
+            http_client=ollama_http,
+        )
+        ollama_llm = lk_openai.LLM(model="gemma3:4b", client=ollama_client)
+    except Exception as e:
+        logger.error(f"Failed to initialize LLM client: {e}")
+        return
 
-    session = AgentSession(
-        vad=ctx.proc.userdata["vad"],
-        stt=ctx.proc.userdata["stt"],
-        llm=ollama_llm,
-        tts=ctx.proc.userdata["tts"],
-        min_endpointing_delay=float(os.getenv("VAGENT_MIN_ENDPOINTING_DELAY", "0.5")),
-    )
+    try:
+        # Ensure models are available, falling back to lazy loading if prewarm failed
+        vad = ctx.proc.userdata.get("vad")
+        if not vad:
+            vad = silero.VAD.load()
+            
+        stt = ctx.proc.userdata.get("stt")
+        if not stt:
+            # Fallback STT initialization if prewarm failed
+            beam_size = int(os.getenv("VAGENT_STT_BEAM_SIZE", "1"))
+            vad_filter = os.getenv("VAGENT_STT_VAD_FILTER", "1").strip().lower() in {"1", "true", "yes", "on"}
+            without_timestamps = os.getenv("VAGENT_STT_WITHOUT_TIMESTAMPS", "1").strip().lower() in {"1", "true", "yes", "on"}
+            stt = FasterWhisperSTT(
+                model_path=str(MODELS_DIR),
+                device="cuda",
+                compute_type="float16",
+                beam_size=beam_size,
+                vad_filter=vad_filter,
+                without_timestamps=without_timestamps,
+            )
+            stt.load()
 
-    await session.start(
-        agent=VoiceAssistant(),
-        room=ctx.room,
-        room_input_options=RoomInputOptions(close_on_disconnect=False),
-    )
+        tts = ctx.proc.userdata.get("tts")
+        if not tts:
+            tts = KokoroTTS(
+                base_url="http://localhost:8880/v1",
+                voice="af_heart",
+            )
+
+        session = AgentSession(
+            vad=vad,
+            stt=stt,
+            llm=ollama_llm,
+            tts=tts,
+            # Aggressive endpointing for speed
+            min_endpointing_delay=float(os.getenv("VAGENT_MIN_ENDPOINTING_DELAY", "0.1")),
+        )
+    except Exception as e:
+        logger.error(f"Failed to create AgentSession: {e}")
+        return
+
+    try:
+        await session.start(
+            agent=VoiceAssistant(),
+            room=ctx.room,
+            room_input_options=RoomInputOptions(close_on_disconnect=False),
+        )
+    except Exception as e:
+        logger.error(f"Failed to start session: {e}")
 
 
 def main():
-    cli.run_app(server)
+    try:
+        cli.run_app(server)
+    except Exception as e:
+        logger.critical(f"Application failed to run: {e}")
 
 
 if __name__ == "__main__":

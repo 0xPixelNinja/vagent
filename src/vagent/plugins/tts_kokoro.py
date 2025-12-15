@@ -136,6 +136,12 @@ class KokoroChunkedStream(tts.ChunkedStream):
                             first_audio_marked = True
                             tracker.tts_first_audio_chunk()
                         output_emitter.push(chunk)
+        except httpx.HTTPStatusError as e:
+            logger.error(f"TTS HTTP error: {e.response.status_code} - {e.response.text}")
+        except httpx.RequestError as e:
+            logger.error(f"TTS request failed: {e}")
+        except Exception as e:
+            logger.error(f"TTS synthesis failed: {e}")
         finally:
             # Always close out timing for this turn, even if TTS fails.
             tracker.tts_finished()
