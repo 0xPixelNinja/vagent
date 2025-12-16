@@ -68,7 +68,8 @@ class FasterWhisperSTT(stt.STT):
     ) -> stt.SpeechEvent:
         """Recognize speech from audio buffer."""
 
-        LatencyTracker.get().stt_started()
+        request_id = shortuuid()
+        LatencyTracker.get().stt_started(request_id=request_id)
 
         try:
             # Handle both single frame and list of frames
@@ -80,7 +81,7 @@ class FasterWhisperSTT(stt.STT):
             if not frames:
                 return stt.SpeechEvent(
                     type=stt.SpeechEventType.FINAL_TRANSCRIPT,
-                    request_id=shortuuid(),
+                    request_id=request_id,
                     alternatives=[],
                 )
 
@@ -116,11 +117,11 @@ class FasterWhisperSTT(stt.STT):
 
             logger.debug(f"Transcribed: {full_text}")
 
-            LatencyTracker.get().stt_finished(full_text)
+            LatencyTracker.get().stt_finished(full_text, request_id=request_id)
 
             return stt.SpeechEvent(
                 type=stt.SpeechEventType.FINAL_TRANSCRIPT,
-                request_id=shortuuid(),
+                request_id=request_id,
                 alternatives=[
                     stt.SpeechData(
                         text=full_text,
@@ -133,6 +134,6 @@ class FasterWhisperSTT(stt.STT):
             logger.error(f"STT recognition failed: {e}")
             return stt.SpeechEvent(
                 type=stt.SpeechEventType.FINAL_TRANSCRIPT,
-                request_id=shortuuid(),
+                request_id=request_id,
                 alternatives=[],
             )

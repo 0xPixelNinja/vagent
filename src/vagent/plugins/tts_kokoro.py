@@ -102,7 +102,7 @@ class KokoroChunkedStream(tts.ChunkedStream):
         request_id = shortuuid()
 
         tracker = LatencyTracker.get()
-        tracker.tts_started(self._input_text)
+        tracker.tts_started(self._input_text, request_id=request_id)
         first_audio_marked = False
 
         output_emitter.initialize(
@@ -134,7 +134,7 @@ class KokoroChunkedStream(tts.ChunkedStream):
                     if chunk:
                         if not first_audio_marked:
                             first_audio_marked = True
-                            tracker.tts_first_audio_chunk()
+                            tracker.tts_first_audio_chunk(request_id=request_id)
                         output_emitter.push(chunk)
         except httpx.HTTPStatusError as e:
             logger.error(f"TTS HTTP error: {e.response.status_code} - {e.response.text}")
@@ -144,4 +144,4 @@ class KokoroChunkedStream(tts.ChunkedStream):
             logger.error(f"TTS synthesis failed: {e}")
         finally:
             # Always close out timing for this turn, even if TTS fails.
-            tracker.tts_finished()
+            tracker.tts_finished(request_id=request_id)

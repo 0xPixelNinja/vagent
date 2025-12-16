@@ -25,6 +25,17 @@ from livekit.agents import (
 from livekit.plugins import silero, openai as lk_openai
 
 from vagent.plugins import FasterWhisperSTT, KokoroTTS, VibeVoiceTTS
+from vagent.utils.latency import LatencyTracker
+from vagent.utils.lk_latency_wrap import instrument_livekit_stt, instrument_livekit_tts
+
+try:
+    # LiveKit plugin modules register themselves and must be imported on the main thread.
+    from livekit.plugins import cartesia as lk_cartesia  # type: ignore
+
+    _LK_CARTESIA_IMPORT_ERROR: Exception | None = None
+except Exception as e:  # pragma: no cover
+    lk_cartesia = None  # type: ignore
+    _LK_CARTESIA_IMPORT_ERROR = e
 
 load_dotenv()
 
@@ -54,31 +65,116 @@ def prewarm(proc: JobProcess):
     except Exception as e:
         logger.error(f"Failed to load VAD model: {e}")
 
-    # Latency/quality knobs
-    # Default beam_size to 1 for speed
-    beam_size = int(os.getenv("VAGENT_STT_BEAM_SIZE", "1"))
-    vad_filter = os.getenv("VAGENT_STT_VAD_FILTER", "1").strip().lower() in {"1", "true", "yes", "on"}
-    without_timestamps = os.getenv("VAGENT_STT_WITHOUT_TIMESTAMPS", "1").strip().lower() in {"1", "true", "yes", "on"}
+    stt_engine = os.getenv("VAGENT_STT_ENGINE", "whisper").strip().lower()
 
-    try:
-        stt_instance = FasterWhisperSTT(
-            model_path=str(MODELS_DIR),
-            device="cuda",
-            compute_type="float16",
-            beam_size=beam_size,
-            vad_filter=vad_filter,
-            without_timestamps=without_timestamps,
-        )
-        stt_instance.load()  # Load model into VRAM immediately
-        proc.userdata["stt"] = stt_instance
-    except Exception as e:
-        logger.error(f"Failed to initialize STT: {e}")
+    if stt_engine == "cartesia":
+        try:
+            cartesia_stt_model = os.getenv("VAGENT_CARTESIA_STT_MODEL", "ink-whisper")
+            cartesia_stt_language = os.getenv("VAGENT_CARTESIA_STT_LANGUAGE", "en")
+            cartesia_api_key = os.getenv("VAGENT_CARTESIA_API_KEY") or os.getenv("CARTESIA_API_KEY")
+            if cartesia_api_key:
+                os.environ.setdefault("CARTESIA_API_KEY", cartesia_api_key)
 
-    # TTS engine selection: "kokoro" (default) or "vibevoice"
+            try:
+                if lk_cartesia is None:
+                    raise RuntimeError(_LK_CARTESIA_IMPORT_ERROR or "Cartesia plugin not installed")
+
+                proc.userdata["stt"] = lk_cartesia.STT(
+                    model=cartesia_stt_model,
+                    language=cartesia_stt_language,
+                )
+                # Add latency metrics even for LiveKit-provided plugins.
+                if LatencyTracker.get().enabled:
+                    proc.userdata["stt"] = instrument_livekit_stt(proc.userdata["stt"])
+                logger.info("Using Cartesia STT (LiveKit plugin)")
+            except Exception as e:
+                logger.warning(f"LiveKit Cartesia STT plugin unavailable, falling back to custom: {e}")
+
+                from vagent.plugins import CartesiaSTT
+
+                cartesia_version = os.getenv("VAGENT_CARTESIA_VERSION", "2025-04-16")
+                cartesia_stt_sr = int(os.getenv("VAGENT_CARTESIA_STT_SAMPLE_RATE", "16000"))
+                cartesia_min_volume = float(os.getenv("VAGENT_CARTESIA_STT_MIN_VOLUME", "0.0"))
+                cartesia_max_silence = float(os.getenv("VAGENT_CARTESIA_STT_MAX_SILENCE_SECS", "0.8"))
+
+                proc.userdata["stt"] = CartesiaSTT(
+                    api_key=cartesia_api_key or "",
+                    model=cartesia_stt_model,
+                    language=cartesia_stt_language,
+                    cartesia_version=cartesia_version,
+                    sample_rate=cartesia_stt_sr,
+                    min_volume=cartesia_min_volume,
+                    max_silence_duration_secs=cartesia_max_silence,
+                )
+                logger.info("Using Cartesia STT (custom plugin)")
+        except Exception as e:
+            logger.error(f"Failed to initialize Cartesia STT: {e}")
+    else:
+        # Latency/quality knobs
+        # Default beam_size to 1 for speed
+        beam_size = int(os.getenv("VAGENT_STT_BEAM_SIZE", "1"))
+        vad_filter = os.getenv("VAGENT_STT_VAD_FILTER", "1").strip().lower() in {"1", "true", "yes", "on"}
+        without_timestamps = os.getenv("VAGENT_STT_WITHOUT_TIMESTAMPS", "1").strip().lower() in {"1", "true", "yes", "on"}
+
+        try:
+            stt_instance = FasterWhisperSTT(
+                model_path=str(MODELS_DIR),
+                device="cuda",
+                compute_type="float16",
+                beam_size=beam_size,
+                vad_filter=vad_filter,
+                without_timestamps=without_timestamps,
+            )
+            stt_instance.load()  # Load model into VRAM immediately
+            proc.userdata["stt"] = stt_instance
+        except Exception as e:
+            logger.error(f"Failed to initialize STT: {e}")
+
+    # TTS engine selection: "kokoro" (default), "vibevoice", or "cartesia"
     tts_engine = os.getenv("VAGENT_TTS_ENGINE", "kokoro").strip().lower()
     
     try:
-        if tts_engine == "vibevoice":
+        if tts_engine == "cartesia":
+            cartesia_model = os.getenv("VAGENT_CARTESIA_TTS_MODEL", "sonic-3")
+            cartesia_voice_id = os.getenv("VAGENT_CARTESIA_VOICE_ID", "")
+            cartesia_language = os.getenv("VAGENT_CARTESIA_TTS_LANGUAGE", "en")
+            cartesia_api_key = os.getenv("VAGENT_CARTESIA_API_KEY") or os.getenv("CARTESIA_API_KEY")
+            if cartesia_api_key:
+                os.environ.setdefault("CARTESIA_API_KEY", cartesia_api_key)
+
+            try:
+                if lk_cartesia is None:
+                    raise RuntimeError(_LK_CARTESIA_IMPORT_ERROR or "Cartesia plugin not installed")
+
+                proc.userdata["tts"] = lk_cartesia.TTS(
+                    model=cartesia_model,
+                    voice=cartesia_voice_id,
+                    language=cartesia_language,
+                )
+                # Add latency metrics even for LiveKit-provided plugins.
+                if LatencyTracker.get().enabled:
+                    proc.userdata["tts"] = instrument_livekit_tts(proc.userdata["tts"])
+                logger.info("Using Cartesia TTS (LiveKit plugin)")
+            except Exception as e:
+                logger.warning(f"LiveKit Cartesia TTS plugin unavailable, falling back to custom: {e}")
+
+                from vagent.plugins import CartesiaTTS
+
+                cartesia_version = os.getenv("VAGENT_CARTESIA_VERSION", "2025-04-16")
+                cartesia_sr = int(os.getenv("VAGENT_CARTESIA_TTS_SAMPLE_RATE", "24000"))
+                cartesia_max_buffer = int(os.getenv("VAGENT_CARTESIA_TTS_MAX_BUFFER_DELAY_MS", "3000"))
+
+                proc.userdata["tts"] = CartesiaTTS(
+                    api_key=cartesia_api_key or "",
+                    voice_id=cartesia_voice_id,
+                    model_id=cartesia_model,
+                    language=cartesia_language,
+                    cartesia_version=cartesia_version,
+                    sample_rate=cartesia_sr,
+                    max_buffer_delay_ms=cartesia_max_buffer,
+                )
+                logger.info("Using Cartesia TTS (custom plugin)")
+        elif tts_engine == "vibevoice":
             # VibeVoice-Realtime TTS via WebSocket
             vibevoice_url = os.getenv("VAGENT_VIBEVOICE_URL", "ws://localhost:3000")
             vibevoice_voice = os.getenv("VAGENT_VIBEVOICE_VOICE", "en-WHTest_man")
@@ -159,25 +255,101 @@ async def entrypoint(ctx: JobContext):
         stt = ctx.proc.userdata.get("stt")
         if not stt:
             # Fallback STT initialization if prewarm failed
-            beam_size = int(os.getenv("VAGENT_STT_BEAM_SIZE", "1"))
-            vad_filter = os.getenv("VAGENT_STT_VAD_FILTER", "1").strip().lower() in {"1", "true", "yes", "on"}
-            without_timestamps = os.getenv("VAGENT_STT_WITHOUT_TIMESTAMPS", "1").strip().lower() in {"1", "true", "yes", "on"}
-            stt = FasterWhisperSTT(
-                model_path=str(MODELS_DIR),
-                device="cuda",
-                compute_type="float16",
-                beam_size=beam_size,
-                vad_filter=vad_filter,
-                without_timestamps=without_timestamps,
-            )
-            stt.load()
+            stt_engine = os.getenv("VAGENT_STT_ENGINE", "whisper").strip().lower()
+
+            if stt_engine == "cartesia":
+                cartesia_stt_model = os.getenv("VAGENT_CARTESIA_STT_MODEL", "ink-whisper")
+                cartesia_stt_language = os.getenv("VAGENT_CARTESIA_STT_LANGUAGE", "en")
+                cartesia_api_key = os.getenv("VAGENT_CARTESIA_API_KEY") or os.getenv("CARTESIA_API_KEY")
+                if cartesia_api_key:
+                    os.environ.setdefault("CARTESIA_API_KEY", cartesia_api_key)
+
+                try:
+                    if lk_cartesia is None:
+                        raise RuntimeError(_LK_CARTESIA_IMPORT_ERROR or "Cartesia plugin not installed")
+
+                    stt = lk_cartesia.STT(
+                        model=cartesia_stt_model,
+                        language=cartesia_stt_language,
+                    )
+                    if LatencyTracker.get().enabled:
+                        stt = instrument_livekit_stt(stt)
+                except Exception as e:
+                    logger.warning(f"LiveKit Cartesia STT plugin unavailable, falling back to custom: {e}")
+
+                    from vagent.plugins import CartesiaSTT
+
+                    cartesia_version = os.getenv("VAGENT_CARTESIA_VERSION", "2025-04-16")
+                    cartesia_stt_sr = int(os.getenv("VAGENT_CARTESIA_STT_SAMPLE_RATE", "16000"))
+                    cartesia_min_volume = float(os.getenv("VAGENT_CARTESIA_STT_MIN_VOLUME", "0.0"))
+                    cartesia_max_silence = float(os.getenv("VAGENT_CARTESIA_STT_MAX_SILENCE_SECS", "0.8"))
+
+                    stt = CartesiaSTT(
+                        api_key=cartesia_api_key or "",
+                        model=cartesia_stt_model,
+                        language=cartesia_stt_language,
+                        cartesia_version=cartesia_version,
+                        sample_rate=cartesia_stt_sr,
+                        min_volume=cartesia_min_volume,
+                        max_silence_duration_secs=cartesia_max_silence,
+                    )
+            else:
+                beam_size = int(os.getenv("VAGENT_STT_BEAM_SIZE", "1"))
+                vad_filter = os.getenv("VAGENT_STT_VAD_FILTER", "1").strip().lower() in {"1", "true", "yes", "on"}
+                without_timestamps = os.getenv("VAGENT_STT_WITHOUT_TIMESTAMPS", "1").strip().lower() in {"1", "true", "yes", "on"}
+                stt = FasterWhisperSTT(
+                    model_path=str(MODELS_DIR),
+                    device="cuda",
+                    compute_type="float16",
+                    beam_size=beam_size,
+                    vad_filter=vad_filter,
+                    without_timestamps=without_timestamps,
+                )
+                stt.load()
 
         tts = ctx.proc.userdata.get("tts")
         if not tts:
             # Fallback TTS initialization if prewarm failed
             tts_engine = os.getenv("VAGENT_TTS_ENGINE", "kokoro").strip().lower()
             
-            if tts_engine == "vibevoice":
+            if tts_engine == "cartesia":
+                cartesia_model = os.getenv("VAGENT_CARTESIA_TTS_MODEL", "sonic-3")
+                cartesia_voice_id = os.getenv("VAGENT_CARTESIA_VOICE_ID", "")
+                cartesia_language = os.getenv("VAGENT_CARTESIA_TTS_LANGUAGE", "en")
+                cartesia_api_key = os.getenv("VAGENT_CARTESIA_API_KEY") or os.getenv("CARTESIA_API_KEY")
+                if cartesia_api_key:
+                    os.environ.setdefault("CARTESIA_API_KEY", cartesia_api_key)
+
+                try:
+                    if lk_cartesia is None:
+                        raise RuntimeError(_LK_CARTESIA_IMPORT_ERROR or "Cartesia plugin not installed")
+
+                    tts = lk_cartesia.TTS(
+                        model=cartesia_model,
+                        voice=cartesia_voice_id,
+                        language=cartesia_language,
+                    )
+                    if LatencyTracker.get().enabled:
+                        tts = instrument_livekit_tts(tts)
+                except Exception as e:
+                    logger.warning(f"LiveKit Cartesia TTS plugin unavailable, falling back to custom: {e}")
+
+                    from vagent.plugins import CartesiaTTS
+
+                    cartesia_version = os.getenv("VAGENT_CARTESIA_VERSION", "2025-04-16")
+                    cartesia_sr = int(os.getenv("VAGENT_CARTESIA_TTS_SAMPLE_RATE", "24000"))
+                    cartesia_max_buffer = int(os.getenv("VAGENT_CARTESIA_TTS_MAX_BUFFER_DELAY_MS", "3000"))
+
+                    tts = CartesiaTTS(
+                        api_key=cartesia_api_key or "",
+                        voice_id=cartesia_voice_id,
+                        model_id=cartesia_model,
+                        language=cartesia_language,
+                        cartesia_version=cartesia_version,
+                        sample_rate=cartesia_sr,
+                        max_buffer_delay_ms=cartesia_max_buffer,
+                    )
+            elif tts_engine == "vibevoice":
                 vibevoice_url = os.getenv("VAGENT_VIBEVOICE_URL", "ws://localhost:3000")
                 vibevoice_voice = os.getenv("VAGENT_VIBEVOICE_VOICE", "en-WHTest_man")
                 vibevoice_cfg = float(os.getenv("VAGENT_VIBEVOICE_CFG", "1.5"))

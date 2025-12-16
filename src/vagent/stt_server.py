@@ -18,6 +18,7 @@ logger = logging.getLogger("stt-server")
 
 # Global model instance
 model: WhisperModel | None = None
+_model_lock: asyncio.Lock | None = None
 
 # Configuration
 PROJECT_ROOT = Path(__file__).parent.parent.parent
@@ -29,7 +30,7 @@ COMPUTE_TYPE = "float16"
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Load the model on startup."""
-    global model
+    global model, _model_lock
     try:
         logger.info(f"Loading Whisper model from {MODELS_DIR}")
         model = WhisperModel(
@@ -37,6 +38,7 @@ async def lifespan(app: FastAPI):
             device=DEVICE,
             compute_type=COMPUTE_TYPE,
         )
+        _model_lock = asyncio.Lock()
         logger.info("Whisper model loaded successfully")
     except Exception as e:
         logger.error(f"Failed to load Whisper model: {e}")
@@ -44,6 +46,7 @@ async def lifespan(app: FastAPI):
     yield
     # Cleanup if needed
     model = None
+    _model_lock = None
 
 
 app = FastAPI(lifespan=lifespan)
@@ -72,10 +75,11 @@ async def transcribe(
     sample_rate: Annotated[int, Form()] = 48000,
     channels: Annotated[int, Form()] = 1,
 ):
-    if model is None:
+    if model is None or _model_lock is None:
         return {"error": "Model not loaded", "text": ""}
 
     local_model = model
+    model_lock = _model_lock
 
     try:
         # Read audio bytes
@@ -95,36 +99,35 @@ async def transcribe(
         if sample_rate != 16000:
             audio_data = resample_to_16k(audio_data, sample_rate)
 
-        # Run transcription
-        # We run this in a thread pool automatically by FastAPI since it's not an async def 
-        # (Wait, WhisperModel.transcribe is blocking, so we should run it in executor if we want async concurrency,
-        # but FastAPI handles standard defs in threadpool. However, we made this route async def to await file.read().
-        # So we must wrap the blocking call.)
-        
+        # Run transcription.
+        # faster-whisper returns a *lazy* iterator for segments. If we iterate it on the event loop thread,
+        # the server can appear "stuck" (requests + shutdown hang). Consume segments inside the executor.
+        # Also serialize access: WhisperModel isn't guaranteed thread-safe across concurrent requests.
         loop = asyncio.get_running_loop()
-        
-        segments, info = await loop.run_in_executor(
-            None,
-            lambda: local_model.transcribe(
+
+        def _transcribe_sync():
+            segments, info = local_model.transcribe(
                 audio_data,
                 language=language,
                 beam_size=beam_size,
                 vad_filter=vad_filter,
                 without_timestamps=without_timestamps,
             )
-        )
+            text_parts = [segment.text.strip() for segment in segments]
+            full_text = " ".join(p for p in text_parts if p)
+            return full_text, info.language, info.language_probability
 
-        text_parts = [segment.text.strip() for segment in segments]
-        full_text = " ".join(text_parts)
+        async with model_lock:
+            full_text, detected_language, language_probability = await loop.run_in_executor(None, _transcribe_sync)
         
         return {
             "text": full_text,
-            "language": info.language,
-            "language_probability": info.language_probability
+            "language": detected_language,
+            "language_probability": language_probability
         }
 
     except Exception as e:
-        logger.error(f"Transcription failed: {e}")
+        logger.exception("Transcription failed")
         return {"error": str(e), "text": ""}
 
 if __name__ == "__main__":

@@ -105,7 +105,7 @@ class VibeVoiceChunkedStream(tts.ChunkedStream):
         request_id = shortuuid()
 
         tracker = LatencyTracker.get()
-        tracker.tts_started(self._input_text)
+        tracker.tts_started(self._input_text, request_id=request_id)
         first_audio_marked = False
 
         output_emitter.initialize(
@@ -119,7 +119,7 @@ class VibeVoiceChunkedStream(tts.ChunkedStream):
             import websockets
         except ImportError:
             logger.error("websockets package required for VibeVoice TTS. Install with: pip install websockets")
-            tracker.tts_finished()
+            tracker.tts_finished(request_id=request_id)
             return
 
         # Build WebSocket URL with query parameters
@@ -146,7 +146,7 @@ class VibeVoiceChunkedStream(tts.ChunkedStream):
                     if isinstance(message, bytes):
                         if not first_audio_marked:
                             first_audio_marked = True
-                            tracker.tts_first_audio_chunk()
+                            tracker.tts_first_audio_chunk(request_id=request_id)
                         
                         # Convert PCM16 bytes to PCM bytes for LiveKit
                         # VibeVoice outputs 16-bit signed PCM at 24kHz
@@ -160,4 +160,4 @@ class VibeVoiceChunkedStream(tts.ChunkedStream):
         except Exception as e:
             logger.error(f"VibeVoice TTS synthesis failed: {e}")
         finally:
-            tracker.tts_finished()
+            tracker.tts_finished(request_id=request_id)
