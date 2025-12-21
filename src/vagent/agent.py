@@ -24,7 +24,7 @@ from livekit.agents import (
 )
 from livekit.plugins import silero, openai as lk_openai
 
-from vagent.plugins import FasterWhisperSTT, KokoroTTS, VibeVoiceTTS
+from vagent.plugins import FasterWhisperSTT, KokoroTTS, VibeVoiceTTS, WhisperLiveKitSTT
 from vagent.utils.latency import LatencyTracker
 from vagent.utils.lk_latency_wrap import instrument_livekit_stt, instrument_livekit_tts
 
@@ -109,6 +109,21 @@ def prewarm(proc: JobProcess):
                 logger.info("Using Cartesia STT (custom plugin)")
         except Exception as e:
             logger.error(f"Failed to initialize Cartesia STT: {e}")
+    elif stt_engine == "whisperlivekit":
+        # WhisperLiveKit streaming STT via WebSocket
+        try:
+            whisperlivekit_url = os.getenv("VAGENT_WHISPERLIVEKIT_URL", "ws://localhost:8000/asr")
+            whisperlivekit_language = os.getenv("VAGENT_WHISPERLIVEKIT_LANGUAGE", "auto")
+            whisperlivekit_sample_rate = int(os.getenv("VAGENT_WHISPERLIVEKIT_SAMPLE_RATE", "16000"))
+
+            proc.userdata["stt"] = WhisperLiveKitSTT(
+                ws_url=whisperlivekit_url,
+                language=whisperlivekit_language,
+                sample_rate=whisperlivekit_sample_rate,
+            )
+            logger.info(f"Using WhisperLiveKit STT at {whisperlivekit_url}")
+        except Exception as e:
+            logger.error(f"Failed to initialize WhisperLiveKit STT: {e}")
     else:
         # Latency/quality knobs
         # Default beam_size to 1 for speed
@@ -293,6 +308,16 @@ async def entrypoint(ctx: JobContext):
                         min_volume=cartesia_min_volume,
                         max_silence_duration_secs=cartesia_max_silence,
                     )
+            elif stt_engine == "whisperlivekit":
+                whisperlivekit_url = os.getenv("VAGENT_WHISPERLIVEKIT_URL", "ws://localhost:8000/asr")
+                whisperlivekit_language = os.getenv("VAGENT_WHISPERLIVEKIT_LANGUAGE", "auto")
+                whisperlivekit_sample_rate = int(os.getenv("VAGENT_WHISPERLIVEKIT_SAMPLE_RATE", "16000"))
+
+                stt = WhisperLiveKitSTT(
+                    ws_url=whisperlivekit_url,
+                    language=whisperlivekit_language,
+                    sample_rate=whisperlivekit_sample_rate,
+                )
             else:
                 beam_size = int(os.getenv("VAGENT_STT_BEAM_SIZE", "1"))
                 vad_filter = os.getenv("VAGENT_STT_VAD_FILTER", "1").strip().lower() in {"1", "true", "yes", "on"}
